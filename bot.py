@@ -1,17 +1,19 @@
 import os
-import asyncio
-import logging
+import io
+import json
+import time
 import threading
-from io import BytesIO
+from typing import Dict, Tuple, Optional
 
-import aiohttp
+import requests
 from flask import Flask
+
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-from telegram.constants import ParseMode
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -21,335 +23,376 @@ from telegram.ext import (
     filters,
 )
 
-# -------------------------
-# CONFIG
-# -------------------------
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger("jump-bot")
-
+# =========================
+# ENV VARS (Render -> Environment)
+# =========================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TOKEN")
-HF_TOKEN = os.getenv("HF_TOKEN")  # Hugging Face token (Read / Inference permissions)
+HF_TOKEN = os.getenv("HF_TOKEN")  # HuggingFace token
+HF_MODEL_DEFAULT = os.getenv("HF_MODEL", "stabilityai/stable-diffusion-2-1")
 
-# Один выбранный HF-модельный эндпоинт (без меню моделей — как ты просила)
-# Если захочешь поменять модель — меняешь только тут:
-HF_MODEL = os.getenv("HF_MODEL", "stabilityai/stable-diffusion-2-1")
+# IMPORTANT: use HF router base
+HF_BASE_URL = os.getenv("HF_BASE_URL", "https://router.huggingface.co/hf-inference")
 
-# Новый router endpoint (api-inference больше не поддерживается)
-HF_URL = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}"
-
+# Render port for health check
 PORT = int(os.getenv("PORT", "10000"))
 
-# -------------------------
-# SMALL WEB SERVER (Render needs open port)
-# -------------------------
-web_app = Flask(__name__)
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("Нет TELEGRAM_TOKEN (или TOKEN) в переменных окружения Render")
 
-@web_app.get("/")
+# =========================
+# Minimal web server for Render health checks
+# =========================
+app = Flask(__name__)
+
+@app.get("/")
 def root():
-    return "OK", 200
+    return "ok", 200
 
-@web_app.get("/healthz")
+@app.get("/healthz")
 def healthz():
-    return "OK", 200
+    return "ok", 200
 
-def run_web():
-    # host must be 0.0.0.0 for Render
-    web_app.run(host="0.0.0.0", port=PORT)
+def run_health_server():
+    # Render expects binding to 0.0.0.0:PORT
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
-# -------------------------
-# UI TEXTS
-# -------------------------
-TEXT = {
+# =========================
+# UI / i18n
+# =========================
+LANGS = [
+    ("en", "🇬🇧 English"),
+    ("ru", "🇷🇺 Русский"),
+]
+
+TEXT: Dict[str, Dict[str, str]] = {
     "ru": {
-        "choose_lang": "Пожалуйста, выбери язык:",
-        "main_menu": "🏠 *Главное меню*\nВыбери раздел 👇",
-        "ai_design": "🎨 *Дизайн с ИИ*\nВыбери провайдера 👇",
-        "choose_provider": "Выбери провайдера 👇",
-        "choose_ratio": "Выбери размер изображения 👇",
-        "send_prompt": "✍️ Отправь текст промпта.\n\n*Размер:* {ratio}\n\nПосле генерации просто пиши следующий промпт — /start больше не нужен.",
-        "generating": "⏳ Генерирую картинку…",
-        "error_prefix": "Ошибка генерации 😕\n\n",
-        "need_token": "Не найден HF_TOKEN. Добавь его в Render → Environment Variables.",
-        "back": "⬅️ Назад",
-        "provider_hf": "🤗 Hugging Face",
-        "menu_ai": "🎨 Дизайн с ИИ",
-        "ratio_1_1": "1:1",
-        "ratio_9_16": "9:16",
-        "ratio_16_9": "16:9",
-        "hint_menu": "Чтобы открыть меню — нажми /start 🙂",
+        "choose_lang": "Пожалуйста, выберите язык:",
+        "main_menu": "🏠 Главное меню\nВыберите нужный раздел 👇",
+        "design_menu": "🎨 Дизайн с ИИ\nВыберите раздел для работы с изображением 👇",
+        "hf_menu": "🤗 Hugging Face\nВыберите размер изображения 👇",
+        "prompt_intro": "✍️ Отправь текст промпта.\n\nРазмер: {ratio}\nПосле генерации просто пиши следующий промпт — /start больше не нужен.",
+        "generating": "Генерирую картинку... ⏳",
+        "no_hf_token": "❌ Нет HF_TOKEN в Render Environment Variables.\nДобавь HF_TOKEN и сделай redeploy.",
+        "hf_403": "❌ HF 403: у токена нет прав на Inference.\nСоздай новый токен на Hugging Face и включи галочку **Inference → Make calls to Inference Providers**.",
+        "hf_404": "❌ HF 404: модель/эндпоинт не найден.\nПроверь HF_MODEL и базовый URL.",
+        "hf_other": "❌ Ошибка генерации:\n{msg}",
+        "btn_design": "🎨 Дизайн с ИИ",
+        "btn_hf": "🤗 Hugging Face",
+        "btn_back": "⬅️ Назад",
+        "btn_size": "📐 Размер",
+        "btn_ratio_11": "1:1",
+        "btn_ratio_916": "9:16",
+        "btn_ratio_169": "16:9",
     },
     "en": {
         "choose_lang": "Please choose a language:",
-        "main_menu": "🏠 *Main menu*\nChoose a section 👇",
-        "ai_design": "🎨 *AI Design*\nChoose a provider 👇",
-        "choose_provider": "Choose a provider 👇",
-        "choose_ratio": "Choose image size 👇",
-        "send_prompt": "✍️ Send your prompt text.\n\n*Size:* {ratio}\n\nAfter generation just send the next prompt — no need for /start.",
-        "generating": "⏳ Generating image…",
-        "error_prefix": "Generation error 😕\n\n",
-        "need_token": "HF_TOKEN is missing. Add it in Render → Environment Variables.",
-        "back": "⬅️ Back",
-        "provider_hf": "🤗 Hugging Face",
-        "menu_ai": "🎨 AI Design",
-        "ratio_1_1": "1:1",
-        "ratio_9_16": "9:16",
-        "ratio_16_9": "16:9",
-        "hint_menu": "To open menu — send /start 🙂",
+        "main_menu": "🏠 Main menu\nChoose an option 👇",
+        "design_menu": "🎨 AI Design\nChoose image tool 👇",
+        "hf_menu": "🤗 Hugging Face\nChoose image size 👇",
+        "prompt_intro": "✍️ Send a prompt.\n\nSize: {ratio}\nAfter generation, just send the next prompt — /start is not needed.",
+        "generating": "Generating image... ⏳",
+        "no_hf_token": "❌ No HF_TOKEN in Render Environment Variables.\nAdd HF_TOKEN and redeploy.",
+        "hf_403": "❌ HF 403: token has no Inference permissions.\nCreate a new token on Hugging Face and enable **Inference → Make calls to Inference Providers**.",
+        "hf_404": "❌ HF 404: model/endpoint not found.\nCheck HF_MODEL and base URL.",
+        "hf_other": "❌ Generation error:\n{msg}",
+        "btn_design": "🎨 AI Design",
+        "btn_hf": "🤗 Hugging Face",
+        "btn_back": "⬅️ Back",
+        "btn_size": "📐 Size",
+        "btn_ratio_11": "1:1",
+        "btn_ratio_916": "9:16",
+        "btn_ratio_169": "16:9",
     },
 }
 
-def get_lang(context: ContextTypes.DEFAULT_TYPE) -> str:
-    return context.user_data.get("lang", "ru")
+def get_lang(ctx: ContextTypes.DEFAULT_TYPE) -> str:
+    return ctx.user_data.get("lang", "ru")
 
-# -------------------------
-# KEYBOARDS
-# -------------------------
-def kb_lang():
+def t(ctx: ContextTypes.DEFAULT_TYPE, key: str, **kwargs) -> str:
+    lang = get_lang(ctx)
+    s = TEXT.get(lang, TEXT["ru"]).get(key, key)
+    return s.format(**kwargs) if kwargs else s
+
+# =========================
+# Menus (Inline Keyboards)
+# =========================
+def kb_lang() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🇷🇺 Русский", callback_data="lang:ru")],
-        [InlineKeyboardButton("🇬🇧 English", callback_data="lang:en")],
+        [InlineKeyboardButton(label, callback_data=f"lang:{code}")]
+        for code, label in LANGS
     ])
 
-def kb_main(lang: str):
-    t = TEXT[lang]
+def kb_main(ctx: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(t["menu_ai"], callback_data="menu:ai")],
+        [InlineKeyboardButton(t(ctx, "btn_design"), callback_data="menu:design")]
     ])
 
-def kb_ai_design(lang: str):
-    t = TEXT[lang]
+def kb_design(ctx: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(t["provider_hf"], callback_data="provider:hf")],
-        [InlineKeyboardButton(t["back"], callback_data="back:main")],
+        [InlineKeyboardButton(t(ctx, "btn_hf"), callback_data="design:hf")],
+        [InlineKeyboardButton(t(ctx, "btn_back"), callback_data="back:main")],
     ])
 
-def kb_ratio(lang: str):
-    t = TEXT[lang]
+def kb_hf_sizes(ctx: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(t["ratio_1_1"], callback_data="ratio:1:1"),
-            InlineKeyboardButton(t["ratio_9_16"], callback_data="ratio:9:16"),
-            InlineKeyboardButton(t["ratio_16_9"], callback_data="ratio:16:9"),
+            InlineKeyboardButton(t(ctx, "btn_ratio_11"), callback_data="size:1:1"),
+            InlineKeyboardButton(t(ctx, "btn_ratio_916"), callback_data="size:9:16"),
+            InlineKeyboardButton(t(ctx, "btn_ratio_169"), callback_data="size:16:9"),
         ],
-        [InlineKeyboardButton(t["back"], callback_data="back:provider")],
+        [InlineKeyboardButton(t(ctx, "btn_back"), callback_data="back:design")],
     ])
 
-# -------------------------
-# COMMANDS
-# -------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /start всегда открывает выбор языка (как у тебя на скринах)
-    await update.message.reply_text(TEXT["ru"]["choose_lang"], reply_markup=kb_lang())
+def kb_prompt_controls(ctx: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(t(ctx, "btn_size"), callback_data="prompt:size"),
+            InlineKeyboardButton(t(ctx, "btn_back"), callback_data="back:hf"),
+        ]
+    ])
 
-# -------------------------
-# CALLBACKS (buttons)
-# -------------------------
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+# =========================
+# Size mapping
+# =========================
+RATIO_TO_WH: Dict[str, Tuple[int, int]] = {
+    "1:1": (1024, 1024),
+    "9:16": (768, 1344),
+    "16:9": (1344, 768),
+}
 
-    data = query.data
-    # log.info("callback: %s", data)
+def set_mode(ctx: ContextTypes.DEFAULT_TYPE, mode: str):
+    ctx.user_data["mode"] = mode
 
-    if data.startswith("lang:"):
-        lang = data.split(":", 1)[1]
-        context.user_data["lang"] = lang
-        # не чистим весь user_data — чтобы не ломать режим
-        await query.edit_message_text(
-            TEXT[lang]["main_menu"],
-            reply_markup=kb_main(lang),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
+def get_mode(ctx: ContextTypes.DEFAULT_TYPE) -> str:
+    return ctx.user_data.get("mode", "idle")
 
-    lang = get_lang(context)
-    t = TEXT[lang]
+def set_ratio(ctx: ContextTypes.DEFAULT_TYPE, ratio: str):
+    ctx.user_data["ratio"] = ratio
 
-    if data == "menu:ai":
-        await query.edit_message_text(
-            t["ai_design"],
-            reply_markup=kb_ai_design(lang),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
+def get_ratio(ctx: ContextTypes.DEFAULT_TYPE) -> str:
+    return ctx.user_data.get("ratio", "1:1")
 
-    if data == "provider:hf":
-        # включаем режим HF (без меню моделей)
-        context.user_data["mode"] = "hf"
-        await query.edit_message_text(
-            t["choose_ratio"],
-            reply_markup=kb_ratio(lang),
-        )
-        return
+def set_model(ctx: ContextTypes.DEFAULT_TYPE, model: str):
+    ctx.user_data["hf_model"] = model
 
-    if data.startswith("ratio:"):
-        # формат callback_data: ratio:1:1 или ratio:9:16 или ratio:16:9
-        ratio = data.split(":", 1)[1]
-        context.user_data["ratio"] = ratio
-        context.user_data["mode"] = "hf"
-        context.user_data["awaiting_prompt"] = True
+def get_model(ctx: ContextTypes.DEFAULT_TYPE) -> str:
+    return ctx.user_data.get("hf_model", HF_MODEL_DEFAULT)
 
-        await query.edit_message_text(
-            t["send_prompt"].format(ratio=ratio),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    if data == "back:main":
-        await query.edit_message_text(
-            t["main_menu"],
-            reply_markup=kb_main(lang),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    if data == "back:provider":
-        await query.edit_message_text(
-            t["ai_design"],
-            reply_markup=kb_ai_design(lang),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-# -------------------------
-# IMAGE GENERATION (HF router)
-# -------------------------
-def ratio_to_size(ratio: str) -> tuple[int, int]:
-    # стабильные размеры (кратные 8), чтобы SD не ругался
-    # 1:1 => 512x512
-    # 9:16 => 512x912
-    # 16:9 => 912x512
-    if ratio == "9:16":
-        return (512, 912)
-    if ratio == "16:9":
-        return (912, 512)
-    return (512, 512)
-
-async def generate_hf_image_bytes(prompt: str, ratio: str) -> bytes:
-    if not HF_TOKEN:
-        raise RuntimeError("HF_TOKEN_MISSING")
-
-    width, height = ratio_to_size(ratio)
-
-    headers = {
-        "Authorization": f"Bearer {HF_TOKEN}",
-        "Accept": "image/png",
-    }
+# =========================
+# HF call
+# =========================
+def hf_text_to_image(prompt: str, model: str, width: int, height: int) -> bytes:
+    """
+    Calls Hugging Face router inference API and returns image bytes.
+    """
+    url = f"{HF_BASE_URL}/models/{model}"
+    headers = {"Accept": "image/png"}
+    if HF_TOKEN:
+        headers["Authorization"] = f"Bearer {HF_TOKEN}"
 
     payload = {
         "inputs": prompt,
         "parameters": {
             "width": width,
             "height": height,
-            # можно добавить шаги/гиданс, если захочешь:
-            # "num_inference_steps": 25,
-            # "guidance_scale": 7.0,
+            "num_inference_steps": 28,
+            "guidance_scale": 7.0,
         }
     }
 
-    timeout = aiohttp.ClientTimeout(total=120)
+    r = requests.post(url, headers=headers, json=payload, timeout=180)
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(HF_URL, headers=headers, json=payload) as resp:
-            ct = resp.headers.get("content-type", "")
-            body = await resp.read()
+    # Image success
+    ctype = (r.headers.get("content-type") or "").lower()
+    if r.ok and ("image/" in ctype or r.content[:8] == b"\x89PNG\r\n\x1a\n"):
+        return r.content
 
-            # Успех — вернулся бинарный image/*
-            if resp.status == 200 and ct.startswith("image/"):
-                return body
+    # Otherwise error
+    try:
+        data = r.json()
+    except Exception:
+        data = {"error": r.text}
 
-            # Ошибка — обычно JSON
+    code = r.status_code
+    msg = json.dumps(data, ensure_ascii=False)
+
+    # Common HF "model loading" 503 case
+    if code == 503 and isinstance(data, dict):
+        # Sometimes it contains {"error":"Model ... is currently loading", "estimated_time":...}
+        est = data.get("estimated_time")
+        if est:
+            # small wait once and retry
+            time.sleep(min(12, float(est)))
+            r2 = requests.post(url, headers=headers, json=payload, timeout=180)
+            ctype2 = (r2.headers.get("content-type") or "").lower()
+            if r2.ok and ("image/" in ctype2 or r2.content[:8] == b"\x89PNG\r\n\x1a\n"):
+                return r2.content
             try:
-                text = body.decode("utf-8", errors="ignore")
+                data2 = r2.json()
             except Exception:
-                text = str(body)
+                data2 = {"error": r2.text}
+            raise RuntimeError(f"HF error {r2.status_code}: {json.dumps(data2, ensure_ascii=False)}")
 
-            raise RuntimeError(f"HF error {resp.status}: {text}")
+    raise RuntimeError(f"HF error {code}: {msg}")
 
-async def generate_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
-    lang = get_lang(context)
-    t = TEXT[lang]
+# =========================
+# Handlers
+# =========================
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Always start from language selection
+    set_mode(ctx, "lang")
+    await update.message.reply_text(t(ctx, "choose_lang"), reply_markup=kb_lang())
 
-    ratio = context.user_data.get("ratio") or "1:1"
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
 
-    if not HF_TOKEN:
-        await update.message.reply_text(t["need_token"])
+    # Language chosen
+    if data.startswith("lang:"):
+        code = data.split(":", 1)[1]
+        ctx.user_data["lang"] = code
+        set_mode(ctx, "main")
+        await q.edit_message_text(t(ctx, "main_menu"), reply_markup=kb_main(ctx))
         return
 
-    msg = await update.message.reply_text(t["generating"])
+    # Menus
+    if data == "menu:design":
+        set_mode(ctx, "design")
+        await q.edit_message_text(t(ctx, "design_menu"), reply_markup=kb_design(ctx))
+        return
+
+    if data == "design:hf":
+        set_mode(ctx, "hf")
+        await q.edit_message_text(t(ctx, "hf_menu"), reply_markup=kb_hf_sizes(ctx))
+        return
+
+    # Back navigation
+    if data == "back:main":
+        set_mode(ctx, "main")
+        await q.edit_message_text(t(ctx, "main_menu"), reply_markup=kb_main(ctx))
+        return
+
+    if data == "back:design":
+        set_mode(ctx, "design")
+        await q.edit_message_text(t(ctx, "design_menu"), reply_markup=kb_design(ctx))
+        return
+
+    if data == "back:hf":
+        set_mode(ctx, "hf")
+        await q.edit_message_text(t(ctx, "hf_menu"), reply_markup=kb_hf_sizes(ctx))
+        return
+
+    # Size chosen
+    if data.startswith("size:"):
+        ratio = data.split(":", 1)[1]
+        if ratio not in RATIO_TO_WH:
+            ratio = "1:1"
+        set_ratio(ctx, ratio)
+        set_mode(ctx, "await_prompt")
+        await q.edit_message_text(
+            t(ctx, "prompt_intro", ratio=ratio),
+            reply_markup=kb_prompt_controls(ctx),
+        )
+        return
+
+    # While prompting: open size picker
+    if data == "prompt:size":
+        set_mode(ctx, "hf")  # show sizes screen (but we will keep generating mode after pick)
+        await q.edit_message_text(t(ctx, "hf_menu"), reply_markup=kb_hf_sizes(ctx))
+        return
+
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # If user types something but not in prompt mode -> open main menu (or language if missing)
+    mode = get_mode(ctx)
+
+    if mode in ("idle", "lang"):
+        set_mode(ctx, "lang")
+        await update.message.reply_text(t(ctx, "choose_lang"), reply_markup=kb_lang())
+        return
+
+    if mode in ("main", "design", "hf"):
+        # They typed text instead of pressing buttons: show the current menu again
+        if mode == "main":
+            await update.message.reply_text(t(ctx, "main_menu"), reply_markup=kb_main(ctx))
+        elif mode == "design":
+            await update.message.reply_text(t(ctx, "design_menu"), reply_markup=kb_design(ctx))
+        else:
+            await update.message.reply_text(t(ctx, "hf_menu"), reply_markup=kb_hf_sizes(ctx))
+        return
+
+    # Prompt mode
+    prompt = (update.message.text or "").strip()
+    if not prompt:
+        return
+
+    if not HF_TOKEN:
+        await update.message.reply_text(t(ctx, "no_hf_token"))
+        return
+
+    ratio = get_ratio(ctx)
+    width, height = RATIO_TO_WH.get(ratio, (1024, 1024))
+    model = get_model(ctx)
+
+    await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
+    status_msg = await update.message.reply_text(t(ctx, "generating"))
 
     try:
-        img_bytes = await generate_hf_image_bytes(prompt=prompt, ratio=ratio)
-        bio = BytesIO(img_bytes)
+        img_bytes = hf_text_to_image(prompt=prompt, model=model, width=width, height=height)
+        bio = io.BytesIO(img_bytes)
         bio.name = "image.png"
         bio.seek(0)
 
-        await update.message.reply_photo(photo=bio, caption="✅ Готово!")
-        # режим НЕ сбрасываем → можно слать следующий промпт сразу
-        context.user_data["mode"] = "hf"
-        context.user_data["awaiting_prompt"] = True
+        # Send photo and keep prompt mode (no /start needed)
+        await update.message.reply_photo(photo=bio, caption="✅ Готово!" if get_lang(ctx) == "ru" else "✅ Done!")
+        await status_msg.delete()
 
-    except Exception as e:
+        # Keep mode as await_prompt, show quick controls
+        set_mode(ctx, "await_prompt")
+        await update.message.reply_text(
+            t(ctx, "prompt_intro", ratio=ratio),
+            reply_markup=kb_prompt_controls(ctx),
+        )
+
+    except RuntimeError as e:
         err = str(e)
-        if "HF_TOKEN_MISSING" in err:
-            err = t["need_token"]
-        await update.message.reply_text(t["error_prefix"] + err)
-    finally:
-        # удаляем "генерирую..." чтобы не захламлять
-        try:
-            await msg.delete()
-        except Exception:
-            pass
+        await status_msg.delete()
 
-# -------------------------
-# TEXT HANDLER
-# -------------------------
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    if not text:
+        if "HF error 403" in err:
+            await update.message.reply_text(t(ctx, "hf_403"))
+        elif "HF error 404" in err:
+            await update.message.reply_text(t(ctx, "hf_404"))
+        else:
+            await update.message.reply_text(t(ctx, "hf_other", msg=err))
+
+        # stay in prompt mode so they can retry quickly
+        set_mode(ctx, "await_prompt")
+
+# Optional: /menu to open main menu without resetting language
+async def menu_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if "lang" not in ctx.user_data:
+        set_mode(ctx, "lang")
+        await update.message.reply_text(t(ctx, "choose_lang"), reply_markup=kb_lang())
         return
+    set_mode(ctx, "main")
+    await update.message.reply_text(t(ctx, "main_menu"), reply_markup=kb_main(ctx))
 
-    # команды не считаем промптом
-    if text.startswith("/"):
-        return
-
-    mode = context.user_data.get("mode")
-    ratio = context.user_data.get("ratio")
-
-    # ✅ Главный фикс: если выбран HF + размер, то ЛЮБОЙ текст = промпт
-    if mode == "hf" and ratio:
-        await generate_and_send(update, context, prompt=text)
-        return
-
-    # запасной вариант (если вдруг ratio ещё не выбрали)
-    if context.user_data.get("awaiting_prompt"):
-        await generate_and_send(update, context, prompt=text)
-        return
-
-    lang = get_lang(context)
-    await update.message.reply_text(TEXT[lang]["hint_menu"])
-
-# -------------------------
-# MAIN
-# -------------------------
 def main():
-    if not TELEGRAM_TOKEN:
-        raise RuntimeError("Нет TELEGRAM_TOKEN (или TOKEN) в переменных окружения.")
+    # Start health server thread
+    th = threading.Thread(target=run_health_server, daemon=True)
+    th.start()
 
-    # запускаем web (порт) в отдельном потоке — Render будет счастлив
-    threading.Thread(target=run_web, daemon=True).start()
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("menu", menu_cmd))
+    application.add_handler(CallbackQueryHandler(on_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-
-    # Важно: ровно 1 инстанс на Render, иначе будет Conflict getUpdates
-    app.run_polling(drop_pending_updates=True)
+    # IMPORTANT:
+    # Conflict "terminated by other getUpdates request" happens if you run the bot in 2 places.
+    # Make sure ONLY Render is running (no local polling).
+    application.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     main()
