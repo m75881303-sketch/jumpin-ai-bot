@@ -1,3 +1,4 @@
 python-telegram-bot==21.6
-openai>=1.50.0
-flask==3.0.0
+httpx==0.28.1
+Flask==3.0.0
+python-dotenv==1.0.1
