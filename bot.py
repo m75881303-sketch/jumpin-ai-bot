@@ -29,10 +29,10 @@ def healthz():
 
 def run_web():
     port = int(os.getenv("PORT", "10000"))
-    web_app.run(host="0.0.0.0", port=port)
+    web_app.run(host="0.0.0.0", port=TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# --- Telegram bot ---
-TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TOKEN") or ""
+if not TOKEN:
+    raise RuntimeError("Нет TELEGRAM_TOKEN в Render Environment Variables")
 
 START_TEXT = "Привет! Нажми кнопку и отправь промпт."
 BTN_TEXT = "Отправить промпт"
