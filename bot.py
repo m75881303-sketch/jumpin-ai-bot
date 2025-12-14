@@ -35,7 +35,7 @@ HF_TOKEN = os.getenv("HF_TOKEN")  # Hugging Face token (Read / Inference permiss
 
 # Один выбранный HF-модельный эндпоинт (без меню моделей — как ты просила)
 # Если захочешь поменять модель — меняешь только тут:
-HF_MODEL = os.getenv("HF_MODEL", "runwayml/stable-diffusion-v1-5")
+HF_MODEL = os.getenv("HF_MODEL", "stabilityai/stable-diffusion-2-1")
 
 # Новый router endpoint (api-inference больше не поддерживается)
 HF_URL = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}"
