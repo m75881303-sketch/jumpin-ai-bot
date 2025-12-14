@@ -1,12 +1,10 @@
-# bot.py
 import os
+import asyncio
 import threading
-import time
+from io import BytesIO
+
 import requests
-
-from flask import Flask
-from dotenv import load_dotenv
-
+from flask import Flask as FlaskApp
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -21,32 +19,13 @@ from telegram.ext import (
     filters,
 )
 
-# ----------------------------
-# 1) ENV
-# ----------------------------
-load_dotenv()
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TOKEN")
-HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
-
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("Нет TELEGRAM_TOKEN (или TOKEN) в Render Environment Variables")
-
-# HF token можно не ставить, но лучше поставить (меньше лимитов/ошибок)
-# Если HF_TOKEN пустой — попробуем без авторизации (может упираться в ограничения)
-HF_HEADERS = {"Accept": "image/png"}
-if HF_TOKEN:
-    HF_HEADERS["Authorization"] = f"Bearer {HF_TOKEN}"
-
-HF_MODEL_URL = "https://api-inference.huggingface.co/models/stabilityai/sdxl-turbo"
-
-# ----------------------------
-# 2) WEB (для Render порта)
-# ----------------------------
-web = Flask(__name__)
+# -----------------------------
+# Render health check (Flask)
+# -----------------------------
+web = FlaskApp(__name__)
 
 @web.get("/")
-def home():
+def root():
     return "ok", 200
 
 @web.get("/healthz")
@@ -57,108 +36,125 @@ def run_web():
     port = int(os.getenv("PORT", "10000"))
     web.run(host="0.0.0.0", port=port)
 
-# ----------------------------
-# 3) TELEGRAM BOT LOGIC
-# ----------------------------
+# -----------------------------
+# Config from ENV (Render)
+# -----------------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TOKEN")
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+# Модель HF (можешь менять потом)
+HF_MODEL = os.getenv("HF_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
+
 START_TEXT = "Выбери категорию:"
-BTN_ART = "🎨 Арт"
-ASK_PROMPT_TEXT = "Отправь текст промпта 👇\n\nНапример: «Зимний лес в стиле аниме»"
+ASK_PROMPT_TEXT = 'Отправь текст промпта 👇\n\nНапример: «Зимний лес в стиле аниме»'
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(BTN_ART, callback_data="cat_art")]]
-    )
+# -----------------------------
+# Hugging Face Router генерация
+# -----------------------------
+def hf_generate_image_bytes(prompt: str) -> bytes:
+    """
+    Возвращает байты PNG/JPG картинки от Hugging Face Router.
+    """
+    if not HF_TOKEN:
+        raise RuntimeError("Нет HF_TOKEN в Render Environment Variables")
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}"
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json",
+        "Accept": "image/png",
+    }
+    payload = {"inputs": prompt}
+
+    r = requests.post(url, headers=headers, json=payload, timeout=180)
+
+    # Если вернулся JSON (обычно это ошибка)
+    content_type = r.headers.get("content-type", "")
+    if "application/json" in content_type:
+        raise RuntimeError(f"HF error {r.status_code}: {r.text}")
+
+    r.raise_for_status()
+    return r.content
+
+async def generate_image_async(prompt: str) -> bytes:
+    # requests блокирует поток — уводим в отдельный поток
+    return await asyncio.to_thread(hf_generate_image_bytes, prompt)
+
+# -----------------------------
+# Telegram handlers
+# -----------------------------
+def main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎨 Арт", callback_data="art")]
+    ])
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text(START_TEXT, reply_markup=main_menu_keyboard())
+    await update.message.reply_text(START_TEXT, reply_markup=main_keyboard())
 
-async def on_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    if q.data == "cat_art":
-        context.user_data["awaiting_prompt"] = True
-        await q.message.reply_text(ASK_PROMPT_TEXT)
-    else:
-        await q.message.reply_text("Неизвестная категория. Нажми /start")
-
-def hf_generate_image_bytes(prompt: str) -> bytes:
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "num_inference_steps": 1,
-            "guidance_scale": 0.0
-        }
-    }
-
-    r = requests.post(
-        HF_MODEL_URL,
-        headers=HF_HEADERS,
-        json=payload,
-        timeout=90,
-    )
-
-    # У HF иногда бывает очередь/прогрев модели:
-    if r.status_code == 503:
-        try:
-            data = r.json()
-            wait_s = int(data.get("estimated_time", 10))
-        except Exception:
-            wait_s = 10
-        time.sleep(min(max(wait_s, 5), 25))
-        r = requests.post(HF_MODEL_URL, headers=HF_HEADERS, json=payload, timeout=90)
-
-    if r.status_code != 200:
-        # Пытаемся красиво достать текст ошибки
-        err_text = ""
-        try:
-            err_text = r.json()
-        except Exception:
-            err_text = r.text[:500]
-        raise RuntimeError(f"HF error {r.status_code}: {err_text}")
-
-    return r.content
+    if q.data == "art":
+        context.user_data["mode"] = "art"
+        context.user_data["await_prompt"] = True
+        await q.edit_message_text(ASK_PROMPT_TEXT)
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("awaiting_prompt"):
-        await update.message.reply_text("Нажми /start и выбери категорию 🙂")
+    # ждём текст промпта только после выбора категории
+    if not context.user_data.get("await_prompt"):
+        await update.message.reply_text("Нажми /start 🙂")
         return
 
-    prompt = (update.message.text or "").strip()
-    if not prompt:
-        await update.message.reply_text("Пришли текст промпта 🙂")
-        return
+    prompt = update.message.text.strip()
+    context.user_data["await_prompt"] = False  # сбрасываем ожидание
 
-    context.user_data["awaiting_prompt"] = False
-
-    msg = await update.message.reply_text("Генерирую картинку... ⏳")
+    # Быстрое подтверждение
+    await update.message.reply_text("Генерирую картинку… ⏳")
 
     try:
-        img_bytes = hf_generate_image_bytes(prompt)
-        await update.message.reply_photo(photo=img_bytes, caption=f"✅ Готово!\n\nПромпт: {prompt}")
-        await msg.delete()
+        img_bytes = await generate_image_async(prompt)
+
+        bio = BytesIO(img_bytes)
+        bio.name = "image.png"
+        bio.seek(0)
+
+        await update.message.reply_photo(photo=bio, caption="✅ Готово!")
     except Exception as e:
-        await msg.edit_text(
-            "Ошибка генерации 😕\n\n"
-            f"{e}\n\n"
-            "Нажми /start и попробуй ещё раз."
+        # Возвращаем пользователя в режим ожидания промпта (чтобы мог отправить ещё раз)
+        context.user_data["await_prompt"] = True
+        await update.message.reply_text(
+            f"Ошибка генерации 😕\n\n{e}\n\nНажми /start и попробуй ещё раз."
         )
 
-def run_bot():
+async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Нажми /start 🙂")
+
+def build_app():
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("Нет TELEGRAM_TOKEN (или TOKEN) в Render Environment Variables")
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CallbackQueryHandler(on_category))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown))
+    return app
 
-    # drop_pending_updates=True — помогает убрать старые апдейты и снижает шанс конфликтов
+def run_bot():
+    app = build_app()
+    # drop_pending_updates помогает после перезапусков не ловить старые апдейты
     app.run_polling(drop_pending_updates=True)
 
-# ----------------------------
-# 4) ENTRYPOINT
-# ----------------------------
+# -----------------------------
+# Entry point
+# -----------------------------
 if __name__ == "__main__":
-    # Важно: сначала поднимаем веб-сервер для Render, потом бот
-    threading.Thread(target=run_web, daemon=True).start()
+    # Flask для Render healthcheck — в отдельном потоке
+    t = threading.Thread(target=run_web, daemon=True)
+    t.start()
+
+    # Telegram bot polling
     run_bot()
