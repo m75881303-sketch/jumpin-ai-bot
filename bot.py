@@ -319,15 +319,13 @@ def run_telegram_polling():
 
     # Важно: если где-то был webhook — polling не будет работать.
     # PTB сам дергает deleteWebhook внутри run_polling, но оставим как есть.
-    application.run_polling(drop_pending_updates=True)
-
-# -----------------------------
+    application.run_polling(drop_pending_updates=# -----------------------------
 # MAIN
 # -----------------------------
 if __name__ == "__main__":
-    # 1) Telegram polling в отдельном потоке
-    threading.Thread(target=run_telegram_polling, daemon=True).start()
+    # 1) Flask в отдельном потоке (healthcheck для Render)
+    threading.Thread(target=run_flask, daemon=True).start()
 
-    # 2) Flask в основном потоке (Render healthcheck)
-    log.info("✅ Starting Flask server...")
-    run_flask()
+    # 2) Telegram polling — В ГЛАВНОМ ПОТОКЕ
+    log.info("✅ Starting Telegram polling in main thread...")
+    run_telegram_polling()
