@@ -1,14 +1,19 @@
 import os
-import io
+import asyncio
 import logging
 import threading
-import requests
-from flask import Flask, Response
+from io import BytesIO
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import aiohttp
+from flask import Flask
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
@@ -16,224 +21,335 @@ from telegram.ext import (
     filters,
 )
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("jumpin-bot")
+# -------------------------
+# CONFIG
+# -------------------------
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("jump-bot")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-HF_TOKEN = os.getenv("HF_TOKEN")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TOKEN")
+HF_TOKEN = os.getenv("HF_TOKEN")  # Hugging Face token (Read / Inference permissions)
+
+# Один выбранный HF-модельный эндпоинт (без меню моделей — как ты просила)
+# Если захочешь поменять модель — меняешь только тут:
+HF_MODEL = os.getenv("HF_MODEL", "runwayml/stable-diffusion-v1-5")
+
+# Новый router endpoint (api-inference больше не поддерживается)
+HF_URL = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}"
+
 PORT = int(os.getenv("PORT", "10000"))
 
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("Нет TELEGRAM_TOKEN в переменных окружения Render")
-
 # -------------------------
-# Render healthcheck server
+# SMALL WEB SERVER (Render needs open port)
 # -------------------------
-flask_app = Flask(__name__)
+web_app = Flask(__name__)
 
-@flask_app.get("/")
+@web_app.get("/")
 def root():
-    return Response("OK", status=200)
+    return "OK", 200
 
-@flask_app.get("/healthz")
+@web_app.get("/healthz")
 def healthz():
-    return Response("OK", status=200)
+    return "OK", 200
 
-def run_flask():
-    flask_app.run(host="0.0.0.0", port=PORT)
+def run_web():
+    # host must be 0.0.0.0 for Render
+    web_app.run(host="0.0.0.0", port=PORT)
 
 # -------------------------
-# HuggingFace inference (router)
+# UI TEXTS
 # -------------------------
-# Здесь оставляем ОДНУ дефолтную модель.
-# Если захочешь поменять — меняешь только эту строку.
-DEFAULT_HF_MODEL = os.getenv("HF_MODEL", "runwayml/stable-diffusion-v1-5")
-
-RATIO_TO_SIZE = {
-    "1:1": (1024, 1024),
-    "9:16": (768, 1365),
-    "16:9": (1365, 768),
+TEXT = {
+    "ru": {
+        "choose_lang": "Пожалуйста, выбери язык:",
+        "main_menu": "🏠 *Главное меню*\nВыбери раздел 👇",
+        "ai_design": "🎨 *Дизайн с ИИ*\nВыбери провайдера 👇",
+        "choose_provider": "Выбери провайдера 👇",
+        "choose_ratio": "Выбери размер изображения 👇",
+        "send_prompt": "✍️ Отправь текст промпта.\n\n*Размер:* {ratio}\n\nПосле генерации просто пиши следующий промпт — /start больше не нужен.",
+        "generating": "⏳ Генерирую картинку…",
+        "error_prefix": "Ошибка генерации 😕\n\n",
+        "need_token": "Не найден HF_TOKEN. Добавь его в Render → Environment Variables.",
+        "back": "⬅️ Назад",
+        "provider_hf": "🤗 Hugging Face",
+        "menu_ai": "🎨 Дизайн с ИИ",
+        "ratio_1_1": "1:1",
+        "ratio_9_16": "9:16",
+        "ratio_16_9": "16:9",
+        "hint_menu": "Чтобы открыть меню — нажми /start 🙂",
+    },
+    "en": {
+        "choose_lang": "Please choose a language:",
+        "main_menu": "🏠 *Main menu*\nChoose a section 👇",
+        "ai_design": "🎨 *AI Design*\nChoose a provider 👇",
+        "choose_provider": "Choose a provider 👇",
+        "choose_ratio": "Choose image size 👇",
+        "send_prompt": "✍️ Send your prompt text.\n\n*Size:* {ratio}\n\nAfter generation just send the next prompt — no need for /start.",
+        "generating": "⏳ Generating image…",
+        "error_prefix": "Generation error 😕\n\n",
+        "need_token": "HF_TOKEN is missing. Add it in Render → Environment Variables.",
+        "back": "⬅️ Back",
+        "provider_hf": "🤗 Hugging Face",
+        "menu_ai": "🎨 AI Design",
+        "ratio_1_1": "1:1",
+        "ratio_9_16": "9:16",
+        "ratio_16_9": "16:9",
+        "hint_menu": "To open menu — send /start 🙂",
+    },
 }
 
-def hf_generate_image(prompt: str, width: int, height: int) -> bytes:
-    if not HF_TOKEN:
-        raise RuntimeError("Нет HF_TOKEN в переменных окружения Render")
+def get_lang(context: ContextTypes.DEFAULT_TYPE) -> str:
+    return context.user_data.get("lang", "ru")
 
-    url = f"https://router.huggingface.co/hf-inference/models/{DEFAULT_HF_MODEL}"
+# -------------------------
+# KEYBOARDS
+# -------------------------
+def kb_lang():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🇷🇺 Русский", callback_data="lang:ru")],
+        [InlineKeyboardButton("🇬🇧 English", callback_data="lang:en")],
+    ])
+
+def kb_main(lang: str):
+    t = TEXT[lang]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(t["menu_ai"], callback_data="menu:ai")],
+    ])
+
+def kb_ai_design(lang: str):
+    t = TEXT[lang]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(t["provider_hf"], callback_data="provider:hf")],
+        [InlineKeyboardButton(t["back"], callback_data="back:main")],
+    ])
+
+def kb_ratio(lang: str):
+    t = TEXT[lang]
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(t["ratio_1_1"], callback_data="ratio:1:1"),
+            InlineKeyboardButton(t["ratio_9_16"], callback_data="ratio:9:16"),
+            InlineKeyboardButton(t["ratio_16_9"], callback_data="ratio:16:9"),
+        ],
+        [InlineKeyboardButton(t["back"], callback_data="back:provider")],
+    ])
+
+# -------------------------
+# COMMANDS
+# -------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /start всегда открывает выбор языка (как у тебя на скринах)
+    await update.message.reply_text(TEXT["ru"]["choose_lang"], reply_markup=kb_lang())
+
+# -------------------------
+# CALLBACKS (buttons)
+# -------------------------
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    # log.info("callback: %s", data)
+
+    if data.startswith("lang:"):
+        lang = data.split(":", 1)[1]
+        context.user_data["lang"] = lang
+        # не чистим весь user_data — чтобы не ломать режим
+        await query.edit_message_text(
+            TEXT[lang]["main_menu"],
+            reply_markup=kb_main(lang),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    lang = get_lang(context)
+    t = TEXT[lang]
+
+    if data == "menu:ai":
+        await query.edit_message_text(
+            t["ai_design"],
+            reply_markup=kb_ai_design(lang),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if data == "provider:hf":
+        # включаем режим HF (без меню моделей)
+        context.user_data["mode"] = "hf"
+        await query.edit_message_text(
+            t["choose_ratio"],
+            reply_markup=kb_ratio(lang),
+        )
+        return
+
+    if data.startswith("ratio:"):
+        # формат callback_data: ratio:1:1 или ratio:9:16 или ratio:16:9
+        ratio = data.split(":", 1)[1]
+        context.user_data["ratio"] = ratio
+        context.user_data["mode"] = "hf"
+        context.user_data["awaiting_prompt"] = True
+
+        await query.edit_message_text(
+            t["send_prompt"].format(ratio=ratio),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if data == "back:main":
+        await query.edit_message_text(
+            t["main_menu"],
+            reply_markup=kb_main(lang),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if data == "back:provider":
+        await query.edit_message_text(
+            t["ai_design"],
+            reply_markup=kb_ai_design(lang),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+# -------------------------
+# IMAGE GENERATION (HF router)
+# -------------------------
+def ratio_to_size(ratio: str) -> tuple[int, int]:
+    # стабильные размеры (кратные 8), чтобы SD не ругался
+    # 1:1 => 512x512
+    # 9:16 => 512x912
+    # 16:9 => 912x512
+    if ratio == "9:16":
+        return (512, 912)
+    if ratio == "16:9":
+        return (912, 512)
+    return (512, 512)
+
+async def generate_hf_image_bytes(prompt: str, ratio: str) -> bytes:
+    if not HF_TOKEN:
+        raise RuntimeError("HF_TOKEN_MISSING")
+
+    width, height = ratio_to_size(ratio)
 
     headers = {
         "Authorization": f"Bearer {HF_TOKEN}",
         "Accept": "image/png",
-        "Content-Type": "application/json",
     }
+
     payload = {
         "inputs": prompt,
-        "parameters": {"width": width, "height": height},
+        "parameters": {
+            "width": width,
+            "height": height,
+            # можно добавить шаги/гиданс, если захочешь:
+            # "num_inference_steps": 25,
+            # "guidance_scale": 7.0,
+        }
     }
 
-    r = requests.post(url, headers=headers, json=payload, timeout=180)
-    if r.status_code != 200:
-        try:
-            msg = r.json()
-        except Exception:
-            msg = r.text
-        raise RuntimeError(f"HF error {r.status_code}: {msg}")
+    timeout = aiohttp.ClientTimeout(total=120)
 
-    return r.content
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(HF_URL, headers=headers, json=payload) as resp:
+            ct = resp.headers.get("content-type", "")
+            body = await resp.read()
 
-# -------------------------
-# Keyboards
-# -------------------------
-def kb_languages():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🇬🇧 English", callback_data="lang:en"),
-         InlineKeyboardButton("🇷🇺 Русский", callback_data="lang:ru")],
-        [InlineKeyboardButton("🇺🇦 Українська", callback_data="lang:uk"),
-         InlineKeyboardButton("🇪🇸 Español", callback_data="lang:es")],
-        [InlineKeyboardButton("🇩🇪 Deutsch", callback_data="lang:de"),
-         InlineKeyboardButton("🇹🇷 Türkçe", callback_data="lang:tr")],
-    ])
+            # Успех — вернулся бинарный image/*
+            if resp.status == 200 and ct.startswith("image/"):
+                return body
 
-def kb_main_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎨 Дизайн с ИИ", callback_data="menu:design")],
-    ])
+            # Ошибка — обычно JSON
+            try:
+                text = body.decode("utf-8", errors="ignore")
+            except Exception:
+                text = str(body)
 
-def kb_design_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🤗 Hugging Face", callback_data="design:hf")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="nav:main")],
-    ])
+            raise RuntimeError(f"HF error {resp.status}: {text}")
 
-def kb_hf_sizes():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("1:1 (1024×1024)", callback_data="ratio:1:1")],
-        [InlineKeyboardButton("9:16 (768×1365)", callback_data="ratio:9:16"),
-         InlineKeyboardButton("16:9 (1365×768)", callback_data="ratio:16:9")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="nav:design")],
-    ])
+async def generate_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
+    lang = get_lang(context)
+    t = TEXT[lang]
 
-def kb_after_send():
-    # Кнопка только “назад” (по твоей логике) + “размер” не обязателен,
-    # но оставим "Выбрать размер" чтобы было удобно.
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📐 Размер", callback_data="nav:hf_sizes"),
-         InlineKeyboardButton("⬅️ Назад", callback_data="nav:design")],
-    ])
+    ratio = context.user_data.get("ratio") or "1:1"
 
-# -------------------------
-# Handlers
-# -------------------------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("👋 Выбери язык:", reply_markup=kb_languages())
-
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data or ""
-
-    if data.startswith("lang:"):
-        context.user_data["lang"] = data.split(":", 1)[1]
-        context.user_data.pop("awaiting_prompt", None)
-        await q.edit_message_text("🏠 Главное меню:", reply_markup=kb_main_menu())
+    if not HF_TOKEN:
+        await update.message.reply_text(t["need_token"])
         return
 
-    if data == "menu:design":
-        context.user_data.pop("awaiting_prompt", None)
-        await q.edit_message_text("🎨 Дизайн с ИИ:", reply_markup=kb_design_menu())
-        return
-
-    if data == "design:hf":
-        context.user_data.pop("awaiting_prompt", None)
-        await q.edit_message_text("🤗 Hugging Face — выбери размер:", reply_markup=kb_hf_sizes())
-        return
-
-    if data == "nav:main":
-        context.user_data.pop("awaiting_prompt", None)
-        await q.edit_message_text("🏠 Главное меню:", reply_markup=kb_main_menu())
-        return
-
-    if data == "nav:design":
-        context.user_data.pop("awaiting_prompt", None)
-        await q.edit_message_text("🎨 Дизайн с ИИ:", reply_markup=kb_design_menu())
-        return
-
-    if data == "nav:hf_sizes":
-        context.user_data.pop("awaiting_prompt", None)
-        await q.edit_message_text("🤗 Hugging Face — выбери размер:", reply_markup=kb_hf_sizes())
-        return
-
-    if data.startswith("ratio:"):
-        ratio = data.split(":", 1)[1]
-        if ratio not in RATIO_TO_SIZE:
-            await q.edit_message_text("Выбери размер из списка:", reply_markup=kb_hf_sizes())
-            return
-
-        context.user_data["ratio"] = ratio
-        context.user_data["awaiting_prompt"] = True
-
-        await q.edit_message_text(
-            "✍️ Отправь текст промпта.\n\n"
-            f"Размер: `{ratio}`\n"
-            "После генерации просто пиши следующий промпт — /start больше не нужен.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-
-    if not context.user_data.get("awaiting_prompt"):
-        await update.message.reply_text("Нажми /start чтобы открыть меню 🙂")
-        return
-
-    ratio = context.user_data.get("ratio", "1:1")
-    width, height = RATIO_TO_SIZE.get(ratio, (1024, 1024))
-
-    msg = await update.message.reply_text("⏳ Генерирую картинку...")
+    msg = await update.message.reply_text(t["generating"])
 
     try:
-        img_bytes = hf_generate_image(prompt=text, width=width, height=height)
-
-        bio = io.BytesIO(img_bytes)
+        img_bytes = await generate_hf_image_bytes(prompt=prompt, ratio=ratio)
+        bio = BytesIO(img_bytes)
         bio.name = "image.png"
         bio.seek(0)
 
-        # Важно: оставляем awaiting_prompt=True, чтобы следующий текст сразу генерил
+        await update.message.reply_photo(photo=bio, caption="✅ Готово!")
+        # режим НЕ сбрасываем → можно слать следующий промпт сразу
+        context.user_data["mode"] = "hf"
         context.user_data["awaiting_prompt"] = True
 
-        await update.message.reply_photo(
-            photo=bio,
-            caption=f"✅ Готово!\nРазмер: `{ratio}`\n\nПиши следующий промпт 👇",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_after_send(),
-        )
-
+    except Exception as e:
+        err = str(e)
+        if "HF_TOKEN_MISSING" in err:
+            err = t["need_token"]
+        await update.message.reply_text(t["error_prefix"] + err)
+    finally:
+        # удаляем "генерирую..." чтобы не захламлять
         try:
             await msg.delete()
         except Exception:
             pass
 
-    except Exception as e:
-        logger.exception("Generation error")
-        context.user_data["awaiting_prompt"] = True
-        await msg.edit_text(
-            f"😕 Ошибка генерации:\n`{e}`\n\n"
-            "Можешь просто отправить другой промпт.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_after_send(),
-        )
+# -------------------------
+# TEXT HANDLER
+# -------------------------
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not text:
+        return
 
+    # команды не считаем промптом
+    if text.startswith("/"):
+        return
+
+    mode = context.user_data.get("mode")
+    ratio = context.user_data.get("ratio")
+
+    # ✅ Главный фикс: если выбран HF + размер, то ЛЮБОЙ текст = промпт
+    if mode == "hf" and ratio:
+        await generate_and_send(update, context, prompt=text)
+        return
+
+    # запасной вариант (если вдруг ratio ещё не выбрали)
+    if context.user_data.get("awaiting_prompt"):
+        await generate_and_send(update, context, prompt=text)
+        return
+
+    lang = get_lang(context)
+    await update.message.reply_text(TEXT[lang]["hint_menu"])
+
+# -------------------------
+# MAIN
+# -------------------------
 def main():
-    threading.Thread(target=run_flask, daemon=True).start()
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("Нет TELEGRAM_TOKEN (или TOKEN) в переменных окружения.")
 
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
+    # запускаем web (порт) в отдельном потоке — Render будет счастлив
+    threading.Thread(target=run_web, daemon=True).start()
+
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    app.run_polling(close_loop=False)
+    # Важно: ровно 1 инстанс на Render, иначе будет Conflict getUpdates
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
