@@ -1,4 +1,17 @@
 import os
+import threading
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.get("/")
+def home():
+    return "ok", 200
+
+def run_web():
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
+    import os
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -43,4 +56,6 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
+    import threading
+    threading.Thread(target=run_web, daemon=True).start()
     main()
