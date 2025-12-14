@@ -331,3 +331,48 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+        import os
+import threading
+from flask import Flask
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # в Render env
+HF_TOKEN = os.getenv("HF_TOKEN")              # в Render env
+
+app = Flask(__name__)
+
+@app.get("/healthz")
+def healthz():
+    return "ok", 200
+
+# ====== handlers ======
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Бот запущен ✅ Напиши промпт текстом.")
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    await update.message.reply_text(f"Принял: {text}\n(дальше тут твоя генерация)")
+
+def run_flask():
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
+
+def main():
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("Нет TELEGRAM_TOKEN в переменных окружения Render")
+
+    # 1) Flask в отдельном потоке (для Render healthcheck)
+    threading.Thread(target=run_flask, daemon=True).start()
+
+    # 2) Telegram polling в основном потоке
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+    # важно: на всякий случай снести webhook, чтобы polling не конфликтовал
+    application.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
